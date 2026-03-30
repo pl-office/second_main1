@@ -2,6 +2,7 @@ import os
 import pickle
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from rollout import Rollout
 
 class Controller:
@@ -12,6 +13,7 @@ class Controller:
         self.train_episodes = params.train_episodes
         self.visu_freq = params.visu_freq
         self.results_dir = params.results_dir
+        self.weights_dir = params.weights_dir
         # train results
         self.joint_reward_col = []
         self.mec_rewards_col = []
@@ -30,8 +32,66 @@ class Controller:
         # rollout
         self.rollout = Rollout(params)
         
+    def _get_checkpoint_path(self):
+        if not os.path.exists(self.weights_dir):
+            os.makedirs(self.weights_dir)
+        return os.path.join(self.weights_dir, "training_checkpoint.pt")
+
+    def _save_checkpoint(self, e_id):
+        checkpoint_path = self._get_checkpoint_path()
+        checkpoint = {
+            "next_episode": e_id + 1,
+            "joint_reward_col": self.joint_reward_col,
+            "mec_rewards_col": self.mec_rewards_col,
+            "actions_col": self.actions_col,
+            "joint_cost_col": self.joint_cost_col,
+            "mec_costs_col": self.mec_costs_col,
+            "mec_comp_qls_col": self.mec_comp_qls_col,
+            "mec_comp_dlys_col": self.mec_comp_dlys_col,
+            "mec_csum_engys_col": self.mec_csum_engys_col,
+            "mec_comp_expns_col": self.mec_comp_expns_col,
+            "mec_overtime_nums_col": self.mec_overtime_nums_col,
+            "v_state_dict": self.rollout.cld_agent.v_net.state_dict(),
+            "p_state_dicts": [p_net.state_dict() for p_net in self.rollout.cld_agent.p_nets],
+        }
+        torch.save(checkpoint, checkpoint_path)
+
+    def _load_checkpoint(self):
+        checkpoint_path = self._get_checkpoint_path()
+        if not os.path.exists(checkpoint_path):
+            return 1
+        # PyTorch 2.6 之后 torch.load 默认 weights_only=True，会限制反序列化内容，
+        # 这里我们加载的是自己保存的完整 checkpoint，显式关闭 weights_only 限制。
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        start_episode = checkpoint.get("next_episode", 1)
+        self.joint_reward_col = checkpoint.get("joint_reward_col", [])
+        self.mec_rewards_col = checkpoint.get("mec_rewards_col", [])
+        self.actions_col = checkpoint.get("actions_col", [])
+        self.joint_cost_col = checkpoint.get("joint_cost_col", [])
+        self.mec_costs_col = checkpoint.get("mec_costs_col", [])
+        self.mec_comp_qls_col = checkpoint.get("mec_comp_qls_col", [])
+        self.mec_comp_dlys_col = checkpoint.get("mec_comp_dlys_col", [])
+        self.mec_csum_engys_col = checkpoint.get("mec_csum_engys_col", [])
+        self.mec_comp_expns_col = checkpoint.get("mec_comp_expns_col", [])
+        self.mec_overtime_nums_col = checkpoint.get("mec_overtime_nums_col", [])
+
+        v_state_dict = checkpoint.get("v_state_dict")
+        if v_state_dict is not None:
+            self.rollout.cld_agent.v_net.load_state_dict(v_state_dict)
+
+        p_state_dicts = checkpoint.get("p_state_dicts")
+        if p_state_dicts is not None:
+            for i, state in enumerate(p_state_dicts):
+                if i < len(self.rollout.cld_agent.p_nets):
+                    self.rollout.cld_agent.p_nets[i].load_state_dict(state)
+                    if i < len(self.rollout.mec_agents):
+                        self.rollout.mec_agents[i].update_net(state)
+
+        return start_episode
+        
     def train(self):
-        for e_id in range(1, self.train_episodes + 1): 
+        start_episode = self._load_checkpoint() if not self.rollout.evaluate else 1
+        for e_id in range(start_episode, self.train_episodes + 1): 
             print("------------------train episode: " + str(e_id) + "------------------")
             
             joint_reward, mec_rewards,actions, \
@@ -84,7 +144,10 @@ class Controller:
                         pickle.dump(self.mec_comp_expns_col, f)
                     with open(self.results_dir + f"main_result{num}mec_overtime_nums_" + str(e_id) + ".pkl", "wb") as f:
                         pickle.dump(self.mec_overtime_nums_col, f)
-                
+            if not self.rollout.evaluate and (e_id % self.rollout.save_freq == 0):
+                self._save_checkpoint(e_id)
+        # 在每个训练epoch结束后添加：
+           
     def evaluate(self):
         joint_reward = 0
         mec_rewards = np.zeros([self.mec_num], dtype = np.float32)
